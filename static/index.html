@@ -63,12 +63,26 @@
   .tag.warn{background:#fff7ed;color:#c2410c}
   .empty{padding:26px;text-align:center;color:var(--dim2);font-size:12.5px}
 
-  .chartbox{padding:8px 10px 10px}
+  .chartbox{padding:8px 10px 10px;position:relative}
   .charthead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px}
   .charthead .sym{font-size:15px;font-weight:700;color:var(--txt)}
   .charthead .nm{font-size:12px;color:var(--dim)}
   .charthead .px{font-size:15px;font-weight:700;margin-left:auto}
-  canvas{width:100%;height:330px;display:block}
+  canvas{width:100%;height:330px;display:block;cursor:crosshair;
+    touch-action:none;user-select:none;-webkit-user-select:none}
+  .chartdrag{margin-top:6px;font-size:11px;color:var(--dim2);display:flex;gap:8px;align-items:baseline}
+  .chartdrag b{margin-left:auto;font-weight:600;color:var(--dim)}
+  /* 指针停在某根 K 线上时的浮层 */
+  .kltip{position:absolute;left:0;top:0;display:none;pointer-events:none;z-index:6;
+    background:rgba(255,255,255,.97);border:1px solid var(--line);border-radius:8px;
+    padding:7px 10px;font-size:11.5px;line-height:1.62;box-shadow:0 4px 16px rgba(15,23,42,.13);
+    min-width:162px}
+  .kltip.show{display:block}
+  .kltip .t{font-weight:700;color:var(--txt);margin-bottom:4px}
+  .kltip .t i{font-style:normal;font-weight:400;color:var(--dim2);font-size:10px;margin-left:3px}
+  .kltip .r{display:flex;justify-content:space-between;gap:16px}
+  .kltip .r span{color:var(--dim2)}
+  .kltip .r b{font-weight:600}
   .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:var(--dim)}
   .legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:4px}
   .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
@@ -124,18 +138,23 @@
       <span class="chip"><span class="dot" id="dotMkt"></span><b id="mktText">—</b></span>
       <span class="sub" id="chartSub">点击左侧任一标的查看</span>
     </div>
-    <div class="chartbox">
+    <div class="chartbox" id="chartbox">
       <div class="charthead">
         <span class="sym" id="cSym">—</span>
         <span class="nm" id="cName"></span>
         <span class="px num" id="cPx"></span>
       </div>
       <canvas id="chart"></canvas>
+      <div class="kltip" id="kltip"></div>
       <div class="legend">
         <span><i style="background:#d92b2b"></i>涨</span>
         <span><i style="background:#0a9b5a"></i>跌</span>
         <span><i style="background:#2563eb"></i>BOLL中轨</span>
         <span><i style="background:#cbd5e1"></i>上下轨</span>
+      </div>
+      <div class="chartdrag">
+        <span>滚轮缩放 · 按住拖动平移 · 双击复位</span>
+        <b id="viewInfo" class="num"></b>
       </div>
       <div class="kv">
         <div><span>60m 中轨</span><b class="num" id="kMid">—</b></div>
@@ -169,7 +188,8 @@
 <script>
 const S = {
   cfg: null, items: [], kl: {}, cur: null, timerBoard: null, timerKl: null, timerDetail: null,
-  feed: [], boardCd: 0, priceCd: 0
+  feed: [], boardCd: 0, priceCd: 0,
+  chartBars: 21          // K 线图默认画多少根：21 根 = 3 个交易日（每天 7 根 60 分钟）
 };
 
 /* ---------------- 工具 ---------------- */
@@ -327,7 +347,40 @@ function bollSeries(closes, n, k){
   return {mid, up, low};
 }
 
+/* 图表视图状态
+     bars      完整序列（140 根）—— 指标预热、以及窗口第一根的涨跌都靠它
+     viewEnd   可见窗口右端（不含），默认贴住最新一根
+     viewCount 可见窗口根数，默认取 config 里的 chart_bars
+     hover     指针停在第几根（窗口内下标，-1 = 没有）
+     geom      最近一次绘制的几何参数，供指针反查与缩放换算 */
+const KL = { bars: [], hover: -1, geom: null, viewEnd: 0, viewCount: 21 };
+let drag = null;   // 鼠标拖动中
+let tch  = null;   // 触摸手势中
+
+function viewReset(){
+  const NB = KL.bars.length;
+  KL.viewCount = Math.max(1, Math.min(S.chartBars || 21, NB || 1));
+  KL.viewEnd   = NB;                     // 默认看最新一段
+  updateViewInfo();
+}
+
+function updateViewInfo(){
+  const el = $('viewInfo');
+  if(!el) return;
+  const NB = KL.bars.length;
+  el.textContent = NB ? ('显示 ' + Math.min(KL.viewCount, NB) + ' / ' + NB + ' 根') : '';
+}
+
 function drawChart(bars){
+  KL.bars = bars || [];
+  KL.hover = -1;
+  drag = null; tch = null;
+  viewReset();
+  hideTip();
+  paintChart();
+}
+
+function paintChart(){
   const cv = $('chart');
   const dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
@@ -335,20 +388,26 @@ function drawChart(bars){
   const g = cv.getContext('2d');
   g.setTransform(dpr,0,0,dpr,0,0);
   g.clearRect(0,0,W,H);
+
+  const bars = KL.bars;
+  KL.geom = null;
   if(!bars.length){
     g.fillStyle = '#9ca3af'; g.font = '12px sans-serif'; g.textAlign='center';
     g.fillText('暂无 K 线数据', W/2, H/2); return;
   }
   const closes = bars.map(b=>b.c);
   const B = bollSeries(closes, 20, 2);
-  const NB = bars.length, SHOW = Math.min(NB, 90);       // 只画最近 90 根，避免挤成一片
-  const s = NB - SHOW;
+  const NB = bars.length;
+  // 可见窗口由视图状态决定（可拖动 / 缩放）；BOLL 始终按全序列算，所以平移缩放后布林线依然有效
+  const SHOW = Math.max(1, Math.min(KL.viewCount || (S.chartBars || 21), NB));
+  const s = Math.max(0, Math.min(KL.viewEnd - SHOW, NB - SHOW));
+  KL.viewCount = SHOW; KL.viewEnd = s + SHOW;      // 回写，保证状态与画面一致
   const seg = bars.slice(s);
 
   const padL=6, padR=54, padT=8, axisH=16, volH=Math.round(H*0.2), gap=12;
   const priceH = H - padT - volH - gap - axisH;
   const step = (W - padL - padR) / SHOW;
-  const cw = Math.max(1.5, step*0.62);
+  const cw = Math.max(1.5, Math.min(step*0.62, 16));   // 根数少时别把蜡烛拉得过胖
 
   let hi = -Infinity, lo = Infinity;
   for(let i=s;i<NB;i++){
@@ -358,6 +417,8 @@ function drawChart(bars){
   const pad = (hi-lo)*0.06 || 1; hi += pad; lo -= pad;
   const Y = p => padT + (hi-p)/(hi-lo)*priceH;
   const X = i => padL + i*step + step/2;
+  // 存几何参数，供 mousemove 反查指针落在哪一根
+  KL.geom = { padL, padR, padT, priceH, volH, volTop: padT+priceH+gap, step, SHOW, s, W, H };
 
   // 网格 + 右侧价格轴
   g.font = '10px sans-serif'; g.textAlign='left'; g.textBaseline='middle';
@@ -412,6 +473,197 @@ function drawChart(bars){
   g.fillStyle = '#e5e7eb'; g.fillRect(padL, volTop-6, W-padL-padR, 1);
   g.fillStyle = 'rgba(255,255,255,0.78)'; g.fillRect(padL+2, volTop+1, 34, 13);
   g.fillStyle = '#9ca3af'; g.fillText('成交量', padL+5, volTop+3);
+
+  // ---- 十字光标：标出指针停留的那根 K 线 ----
+  const hv = KL.hover;
+  if(hv >= 0 && hv < SHOW){
+    const hb = bars[s+hv], hx = X(hv), hy = Math.round(Y(hb.c)) + .5;
+    g.save();
+    g.setLineDash([3,3]); g.lineWidth = 1; g.strokeStyle = '#94a3b8';
+    g.beginPath(); g.moveTo(hx+.5, padT); g.lineTo(hx+.5, volTop+volH); g.stroke();
+    g.beginPath(); g.moveTo(padL, hy); g.lineTo(W-padR, hy); g.stroke();
+    g.restore();
+    // 该根蜡烛描边，一眼定位
+    const ty1 = Math.min(Y(hb.o), Y(hb.c)), ty2 = Math.max(Y(hb.o), Y(hb.c));
+    g.strokeStyle = '#1f2937'; g.lineWidth = 1;
+    g.strokeRect(hx-cw/2-2, ty1-2, cw+4, Math.max(3, ty2-ty1)+4);
+    // 右侧收盘价高亮
+    g.fillStyle = '#1f2937'; g.fillRect(W-padR+1, hy-7, padR-3, 14);
+    g.fillStyle = '#fff'; g.font = '10px sans-serif'; g.textAlign='left'; g.textBaseline='middle';
+    g.fillText(hb.c.toFixed(2), W-padR+5, hy);
+    // 底部时间高亮
+    const lbl = (hb.t||'').slice(5);
+    g.font = '10px sans-serif'; g.textAlign='center'; g.textBaseline='top';
+    const lw = g.measureText(lbl).width + 10;
+    g.fillStyle = '#1f2937'; g.fillRect(hx-lw/2, volTop+volH+1, lw, 14);
+    g.fillStyle = '#fff'; g.fillText(lbl, hx, volTop+volH+3);
+  }
+
+  updateViewInfo();
+}
+
+/* ---------------- K 线指针浮层 ---------------- */
+function hideTip(){ const t = $('kltip'); if(t) t.classList.remove('show'); }
+
+function showTip(i, clientX, clientY){
+  const gm = KL.geom, bars = KL.bars, tip = $('kltip');
+  if(!gm || !tip) return;
+  const bi = gm.s + i, b = bars[bi];
+  if(!b){ hideTip(); return; }
+
+  // 涨跌一律相对「前一根收盘」算，与行情软件口径一致
+  const prev = bi > 0 ? bars[bi-1] : null;
+  const chg  = prev ? b.c - prev.c : null;
+  const pct  = (prev && prev.c) ? (b.c/prev.c - 1) * 100 : null;
+  const amp  = (prev && prev.c) ? (b.h - b.l) / prev.c * 100 : null;
+  const cls  = v => (v > 0 ? 'u' : (v < 0 ? 'd' : 'f'));
+  const sg   = (v, d=2) => (v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(d));
+
+  tip.innerHTML =
+    '<div class="t">' + esc(b.t) + '<i>美东时间</i></div>' +
+    '<div class="r"><span>开</span><b class="num">' + b.o.toFixed(2) + '</b></div>' +
+    '<div class="r"><span>高</span><b class="num">' + b.h.toFixed(2) + '</b></div>' +
+    '<div class="r"><span>低</span><b class="num">' + b.l.toFixed(2) + '</b></div>' +
+    '<div class="r"><span>收</span><b class="num ' + cls(pct) + '">' + b.c.toFixed(2) + '</b></div>' +
+    '<div class="r"><span>涨跌</span><b class="num ' + cls(pct) + '">' + sg(chg) + '　' + sg(pct) + '%</b></div>' +
+    '<div class="r"><span>振幅</span><b class="num">' + (amp == null ? '—' : amp.toFixed(2) + '%') + '</b></div>' +
+    '<div class="r"><span>成交量</span><b class="num">' + fmtVol(b.v) + '</b></div>' +
+    '<div class="r"><span>成交额</span><b class="num">' + fmtAmt(b.amt) + '</b></div>';
+
+  const cr = $('chart').getBoundingClientRect();
+  const br = $('chartbox').getBoundingClientRect();
+  tip.classList.add('show');
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  const rx = clientX - cr.left, ry = clientY - cr.top;
+  let left = (cr.left - br.left) + rx + 16;
+  let top  = (cr.top  - br.top ) + ry - th/2;
+  if(left + tw > br.width - 6) left = (cr.left - br.left) + rx - tw - 16;
+  tip.style.left = Math.max(4, left) + 'px';
+  tip.style.top  = Math.max(4, Math.min(top, br.height - th - 4)) + 'px';
+}
+
+function onChartMove(e){
+  if(drag) return;                    // 拖动中不显示十字光标
+  const gm = KL.geom;
+  if(!gm || !KL.bars.length) return;
+  const cr = $('chart').getBoundingClientRect();
+  const i = Math.max(0, Math.min(gm.SHOW - 1, Math.floor((e.clientX - cr.left - gm.padL) / gm.step)));
+  if(i !== KL.hover){ KL.hover = i; paintChart(); }
+  showTip(i, e.clientX, e.clientY);
+}
+
+function onChartLeave(){
+  if(KL.hover === -1) return;
+  KL.hover = -1; hideTip(); paintChart();
+}
+
+/* ---------------- 缩放 / 平移 ---------------- */
+const VMIN = 8;                    // 最少显示 8 根，再少就看不出形态了
+
+/** 把 viewCount / viewEnd 收回合法区间，保证永远不越出数据范围 */
+function viewClamp(){
+  const NB = KL.bars.length;
+  if(!NB) return;
+  const minC = Math.max(1, Math.min(VMIN, NB));
+  KL.viewCount = Math.max(minC, Math.min(Math.round(KL.viewCount), NB));
+  KL.viewEnd   = Math.max(KL.viewCount, Math.min(Math.round(KL.viewEnd), NB));
+}
+
+/** 以 clientX 处为锚点缩放：锚点对应那根 K 线在屏幕上保持不动（符合直觉） */
+function zoomAt(clientX, factor){
+  const gm = KL.geom;
+  if(!gm || !KL.bars.length) return;
+  const NB = KL.bars.length;
+  const rx = clientX - $('chart').getBoundingClientRect().left;
+  const iAnchor  = (rx - gm.padL) / gm.step;              // 锚点在窗口内的浮点下标
+  const gAnchor  = KL.viewEnd - KL.viewCount + iAnchor;   // 换算成全局下标
+
+  let nc = Math.round(KL.viewCount * factor);
+  nc = Math.max(Math.max(1, Math.min(VMIN, NB)), Math.min(nc, NB));
+  const newStep  = (gm.W - gm.padL - gm.padR) / nc;
+  const iAnchor2 = (rx - gm.padL) / newStep;
+
+  // 原本就贴着最新一根时，缩放后继续保持贴边（否则看盘时一放大就脱离最新行情）
+  const stickRight = KL.viewEnd >= NB;
+  KL.viewCount = nc;
+  KL.viewEnd   = stickRight ? NB : Math.round(gAnchor + nc - iAnchor2);
+  viewClamp();
+  KL.hover = -1; hideTip();
+  paintChart();
+}
+
+/** 屏幕像素位移 → 多少根 */
+function pxToBars(dx){
+  const gm = KL.geom;
+  return gm ? dx / gm.step : 0;
+}
+
+function tDist(e){
+  const a = e.touches[0], b = e.touches[1];
+  return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+}
+
+function onWheel(e){
+  if(!KL.geom) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.deltaY < 0 ? 0.85 : 1.18);   // 向上滚 = 放大（显示的根数变少）
+}
+
+/* ---- 鼠标拖动平移（监听挂在 window 上，拖出画布也能继续）---- */
+function onDragStart(e){
+  if(!KL.geom || !KL.bars.length) return;
+  drag = { x: e.clientX, end: KL.viewEnd };
+  $('chart').style.cursor = 'grabbing';
+}
+function onDragMove(e){
+  if(!drag || !KL.geom) return;
+  KL.viewEnd = drag.end - pxToBars(e.clientX - drag.x);   // 右拖看更早的数据
+  viewClamp();
+  if(KL.hover !== -1){ KL.hover = -1; hideTip(); }
+  paintChart();
+}
+function onDragEnd(){
+  if(!drag) return;
+  drag = null;
+  $('chart').style.cursor = 'crosshair';
+}
+
+/* ---- 触摸：单指平移 / 双指缩放 ---- */
+function onTouchStart(e){
+  if(!KL.geom || !KL.bars.length) return;
+  if(e.cancelable) e.preventDefault();
+  if(e.touches.length === 1){
+    tch = { mode:'pan', x: e.touches[0].clientX, end: KL.viewEnd };
+  }else if(e.touches.length === 2){
+    const gm = KL.geom;
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const rx = cx - $('chart').getBoundingClientRect().left;
+    tch = { mode:'zoom', d0: tDist(e) || 1, c0: KL.viewCount, rx, end: KL.viewEnd,
+            gA: KL.viewEnd - KL.viewCount + (rx - gm.padL) / gm.step };
+  }
+}
+function onTouchMove(e){
+  if(!tch || !KL.geom) return;
+  if(e.cancelable) e.preventDefault();
+  const gm = KL.geom;
+  if(tch.mode === 'pan' && e.touches.length === 1){
+    KL.viewEnd = tch.end - pxToBars(e.touches[0].clientX - tch.x);
+  }else if(tch.mode === 'zoom' && e.touches.length === 2){
+    const NB = KL.bars.length;
+    let nc = Math.round(tch.c0 / (tDist(e) / tch.d0));    // 两指张开 = 放大 = 根数变少
+    nc = Math.max(Math.max(1, Math.min(VMIN, NB)), Math.min(nc, NB));
+    const newStep = (gm.W - gm.padL - gm.padR) / nc;
+    KL.viewCount = nc;
+    KL.viewEnd   = (tch.end >= NB) ? NB : Math.round(tch.gA + nc - (tch.rx - gm.padL) / newStep);
+  }else{
+    return;
+  }
+  viewClamp();
+  if(KL.hover !== -1){ KL.hover = -1; hideTip(); }
+  paintChart();
+}
+function onTouchEnd(e){
+  if(!e.touches.length) tch = null;
 }
 
 /* ---------------- 状态 ---------------- */
@@ -489,6 +741,7 @@ async function boot(){
   const boardSec = (S.cfg.board && S.cfg.board.refresh_sec) || 60;   // 东财榜单真实刷新间隔
   const priceSec = (S.cfg.quote && S.cfg.quote.refresh_sec) || 18;   // 价格刷新（榜单走服务端缓存）
   const klSec    = (S.cfg.kline && S.cfg.kline.refresh_sec) || 300;  // 60 分钟 K 线不必高频
+  S.chartBars    = (S.cfg.ui && S.cfg.ui.chart_bars) || 21;          // 默认只画 3 个交易日
 
   await loadBoard(true);
   S.boardCd = boardSec; S.priceCd = priceSec;
@@ -507,7 +760,22 @@ async function boot(){
   $('btnNow').onclick = () => { S.boardCd = boardSec; S.priceCd = priceSec;
     loadBoard(true).then(loadKlines).then(loadHealth); };
   $('btnClear').onclick = () => { S.feed = []; renderFeed(); };
-  window.addEventListener('resize', () => { if(S.cur) loadDetail(); });
+
+  // K 线交互：悬停看单根详情 · 滚轮缩放 · 拖动平移 · 双击复位 · 触屏单指平移/双指缩放
+  const cv = $('chart');
+  cv.addEventListener('mousemove', onChartMove);
+  cv.addEventListener('mouseleave', onChartLeave);
+  cv.addEventListener('mousedown', onDragStart);
+  cv.addEventListener('wheel', onWheel, {passive:false});
+  cv.addEventListener('dblclick', () => { viewReset(); KL.hover = -1; hideTip(); paintChart(); });
+  cv.addEventListener('touchstart', onTouchStart, {passive:false});
+  cv.addEventListener('touchmove',  onTouchMove,  {passive:false});
+  cv.addEventListener('touchend',   onTouchEnd);
+  cv.addEventListener('touchcancel', onTouchEnd);
+  window.addEventListener('mousemove', onDragMove);
+  window.addEventListener('mouseup', onDragEnd);
+  // 尺寸变化只需重绘，不必重新请求
+  window.addEventListener('resize', () => { if(KL.bars.length) paintChart(); });
 }
 boot();
 </script>

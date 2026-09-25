@@ -24,12 +24,14 @@
     "batch": 200
   },
 
+  "_comment_ui": "chart_bars = K 线图默认画多少根。21 根 = 3 个交易日（每天 7 根 60 分钟 K 线）。注意：布林线仍会用更早的数据预热，所以只画 3 天也不影响指标有效性。",
   "ui": {
     "auto_start": true,
     "show_feed": true,
     "feed_limit": 40,
     "default_period": 60,
-    "periods": [30, 60, 101]
+    "periods": [30, 60, 101],
+    "chart_bars": 21
   },
 
   "indicators": {
