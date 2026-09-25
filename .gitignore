@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据（榜单候选池等，每次运行自动重建）
+cache/
+
+# 日志与临时文件
+*.log
+*.tmp
+_check.js
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

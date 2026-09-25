@@ -1,0 +1,47 @@
+{
+  "port": 8021,
+
+  "_comment_board": "榜单：谁在成交额前 30。东财一次请求返回 pool_size 只并做好排序，前 top_n 只用于展示，其余存成候选池。min_interval_sec 是防风控的硬间隔，不要调小。",
+  "board": {
+    "top_n": 30,
+    "refresh_sec": 60,
+    "min_interval_sec": 60,
+    "pool_size": 200
+  },
+
+  "_comment_kline": "60 分钟 K 线：主源新浪（1023 根/不限流），备源东财。每 60 分钟才出一根新 K 线，refresh_sec 不用调小。",
+  "kline": {
+    "period": 60,
+    "bars": 140,
+    "refresh_sec": 120,
+    "concurrency": 4,
+    "gap_ms": 80
+  },
+
+  "_comment_quote": "实时快照（腾讯）：refresh_sec 是服务端缓存 TTL，前端也是按这个节奏拉 —— 榜单 60 秒才更新一次排名，但价格每 18 秒都是新的。",
+  "quote": {
+    "refresh_sec": 18,
+    "batch": 200
+  },
+
+  "ui": {
+    "auto_start": true,
+    "show_feed": true,
+    "feed_limit": 40,
+    "default_period": 60,
+    "periods": [30, 60, 101]
+  },
+
+  "indicators": {
+    "boll": { "period": 20, "k": 2.0 },
+    "ma": [5, 10, 20]
+  },
+
+  "_comment_rules": "监控条件都在这里开关。加一条新规则 = 在 rules.py 写个类 + 在这里加一行。",
+  "rules": {
+    "top_amount": { "enabled": true, "n": 30 },
+    "pct_spike": { "enabled": true, "abs_pct": 5.0 },
+    "amount_surge": { "enabled": true, "ratio": 2.0 },
+    "boll_break": { "enabled": false, "side": "mid" }
+  }
+}
