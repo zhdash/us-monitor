@@ -646,6 +646,102 @@ class CnbcSource:
 
 
 # --------------------------------------------------------------------------- #
+# 数据源 0.6：新浪美股报价（hq.sinajs.cn —— 承担「当前这根 60 分钟 bar 现在涨跌多少」）
+# --------------------------------------------------------------------------- #
+class SinaQuoteSource:
+    """hq.sinajs.cn 美股报价，**一次请求可带多只**（逗号分隔），响应约 0.2~0.5 秒。
+
+    为什么非它不可（2026-10-08 实测）：
+        * 新浪的**分钟 K 线接口在盘前/盘中不返回「正在走的那根 bar」**——
+          盘前 07:30 ET 请求，最后一根仍是上一交易日 16:00，价格也是收盘价；
+        * 而本接口的 p[1] 给了**盘前/盘中实时价**（实测 07:30 ET 返回 `Oct 08 07:31AM EDT`
+          对应的实时价，秒级跳动），p[21] 给了最近一小时涨幅。
+
+    实测字段（`gb_aapl` = 苹果，0-based，2026-10-08 07:32 ET 取样）：
+        0  名称(中文)      1  最新价(盘前/盘中/盘后，实时)   2  涨跌幅% (相对昨收)
+        3  行情时间(北京)  4  涨跌额                      5  开盘
+        6  最高            7  最低                        8  52周高
+        9  52周低          10 成交量(累计)                11 10日均量
+        12 市值            13 每股收益                   14 PE
+        19 最近1小时成交额 ← 用它判断「这根 60 分钟 bar 走了多少量」
+        21 最近1小时价    22 最近1小时涨跌幅%           23 最近1小时涨跌额
+        24 行情时间(ET)   25 上一交易日收盘时间(ET)      26 上一交易日收盘价 ← 涨跌基准
+        30 最近1小时成交额(另一口径，实测与 19 略有出入)
+
+    限制：非公开文档；字段位置靠约定；**ETF 也覆盖**（SPY/QQQ/IVV 实测通过）。
+    """
+
+    NAME = "新浪报价 (hq.sinajs.cn)"
+    URL = "https://hq.sinajs.cn/list={list}"
+    _TRUST = {"Referer": "https://finance.sina.com.cn/"}
+    BATCH = 60
+
+    def __init__(self):
+        self._cache = _Cache()
+
+    @staticmethod
+    def _f(p, i):
+        try:
+            v = p[i].strip()
+            return float(v) if v not in ("", "-", "0.00" if i in (22, 23) else "\x00") else None
+        except (ValueError, IndexError):
+            return None
+
+    def quotes(self, symbols: list[str], ttl: float = 15.0) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        if not symbols:
+            return out
+        for i in range(0, len(symbols), self.BATCH):
+            chunk = symbols[i: i + self.BATCH]
+            key = "sinahq:" + ",".join(chunk)
+            hit = self._cache.fresh(key, ttl)
+            if hit is not None:
+                out.update(hit)
+                continue
+            url = self.URL.format(list=",".join("gb_" + s.lower() for s in chunk))
+            try:
+                raw = http_get(url, self._TRUST, timeout=10, encoding="gbk")
+            except SourceError:
+                continue
+            got: dict[str, dict] = {}
+            for line in raw.splitlines():
+                if "hq_str_gb_" not in line or '="' not in line:
+                    continue
+                head, _, body = line.partition('="')
+                sym = head.split("hq_str_gb_")[-1].strip().upper()
+                body = body.rstrip('";').rstrip('"')
+                if not body:
+                    continue
+                p = body.split(",")
+                if len(p) < 27:
+                    continue
+                got[sym] = {
+                    "symbol": sym, "source": self.NAME,
+                    "name": p[0] or None,
+                    "price": self._f(p, 1),                # 盘前/盘中/盘后实时价
+                    "pct": self._f(p, 2),                  # 相对上一交易日收盘
+                    "chg": self._f(p, 4),
+                    "open": self._f(p, 5), "high": self._f(p, 6), "low": self._f(p, 7),
+                    "volume": self._f(p, 10),
+                    "amount_1h": self._f(p, 30) or self._f(p, 19),   # 最近 1 小时成交额
+                    "px_1h": self._f(p, 21),               # 最近 1 小时价
+                    "pct_1h": self._f(p, 22),              # 最近 1 小时涨跌幅
+                    "prev_close": self._f(p, 26),          # 上一交易日收盘价
+                    "ts_text": p[24] if len(p) > 24 else None,       # 行情时间（ET）
+                    "prev_ts_text": p[25] if len(p) > 25 else None,  # 上一交易日收盘时间
+                    "ts": time.time(),
+                }
+            self._cache.put(key, got)
+            out.update(got)
+        return out
+
+    def health(self) -> dict:
+        return {"name": self.NAME,
+                "role": "主力：盘前/盘中实时价（供「当前 60 分钟 bar」使用，批量 60 只/次）",
+                "cooldown": 0, "fails": 0}
+
+
+# --------------------------------------------------------------------------- #
 # 门面：给 server.py 用的统一入口
 # --------------------------------------------------------------------------- #
 class MarketData:
@@ -668,6 +764,7 @@ class MarketData:
         self.em = EastmoneySource(board_min_interval=bcfg.get("min_interval_sec", 60))
         self.tx = TencentSource(batch=qcfg.get("batch", 200))
         self.sina = SinaSource()
+        self.sinaq = SinaQuoteSource()
         self.nq = NasdaqSource()
         self.cnbc = CnbcSource()
         self.board_ttl = bcfg.get("refresh_sec", 60)
@@ -832,7 +929,24 @@ class MarketData:
             return got
         return self.cnbc.quotes([symbol]).get(symbol)
 
+    def quotes_now(self, symbols: list[str]) -> dict[str, dict]:
+        """盘前/盘中实时价（批量）—— 专门用来算「当前这根 60 分钟 bar」。
+
+        与 tx.quotes 的区别：腾讯在**盘前返回的是上一交易日收盘快照**（实测
+        07:32 ET 给的是 10-07 16:00:01 的数据），所以盘前必须换新浪报价。
+        这里两个源都取，新浪优先（它盘前/盘中/盘后都有值），腾讯兜底。
+        """
+        out: dict[str, dict] = {}
+        if not symbols:
+            return out
+        out.update(self.sinaq.quotes(symbols, ttl=self.quote_ttl))
+        miss = [s for s in symbols if s not in out]
+        if miss:
+            out.update(self.tx.quotes(miss, ttl=self.quote_ttl))
+        return out
+
     def health(self) -> dict:
-        return {"sina": self.sina.health(), "tencent": self.tx.health(),
+        return {"sina": self.sina.health(), "sina_quote": self.sinaq.health(),
+                "tencent": self.tx.health(),
                 "eastmoney": self.em.health(), "nasdaq": self.nq.health(),
                 "cnbc": self.cnbc.health(), "universe": len(self._universe)}

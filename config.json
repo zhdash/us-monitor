@@ -45,5 +45,11 @@
     "pct_spike": { "enabled": true, "abs_pct": 5.0 },
     "amount_surge": { "enabled": true, "ratio": 2.0 },
     "boll_break": { "enabled": false, "side": "mid" }
+  },
+
+  "_comment_watchlists": "自选框。每个框一条，判据 = 『在成交额前 top_n 内』且『当前 60 分钟 K 线（未走完也算）涨跌幅』超过阈值。加新框 = 在这里加一行，server / 前端都不用改。side: up=涨幅≥thr，down=跌幅≤-thr。",
+  "watchlists": {
+    "up60":   { "name": "60上涨", "enabled": true, "side": "up",   "thr": 0.5 },
+    "down60": { "name": "60下跌", "enabled": true, "side": "down", "thr": 0.5 }
   }
 }

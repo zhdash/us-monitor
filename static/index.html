@@ -101,6 +101,33 @@
   .frow.out .why{background:#f0fdf4;color:#15803d}
   .frow .dt{color:var(--dim);font-size:11.5px;overflow:hidden;text-overflow:ellipsis}
   .foot{color:var(--dim2);font-size:11px;padding:0 14px 16px;line-height:1.7}
+
+  /* ---- 自选框 ---- */
+  .wlsec{margin:0 12px 12px;display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .wl .phead .cnt{font-weight:400;color:var(--dim);font-size:11.5px;margin-left:2px}
+  .wl .phead .thr{font-size:11px;color:var(--dim2);margin-left:auto;font-weight:400}
+  .wlbody{max-height:260px;overflow:auto}
+  .wlrow{display:flex;align-items:baseline;gap:8px;padding:6px 12px;
+    border-bottom:1px solid var(--line2);cursor:pointer;font-size:12.5px}
+  .wlrow:last-child{border-bottom:0}
+  .wlrow:hover{background:#f8fafc}
+  .wlrow.sel{background:#eff6ff;box-shadow:inset 3px 0 0 var(--accent)}
+  .wlrow .rk{color:var(--dim2);width:22px;flex:none;font-size:11px}
+  .wlrow .nm{font-weight:600;flex:none}
+  .wlrow .sym{color:var(--dim2);font-size:11px;flex:none}
+  .wlrow .grow{flex:1}
+  .wlrow .px{font-size:12px;color:var(--dim)}
+  .wlrow .pct{font-weight:700;min-width:62px;text-align:right}
+  .wlrow .dayp{color:var(--dim2);font-size:11px;min-width:56px;text-align:right}
+  .wlrow .bar{width:54px;height:6px;border-radius:3px;background:#eef0f3;flex:none;
+    align-self:center;position:relative;overflow:hidden}
+  .wlrow .bar i{position:absolute;top:0;bottom:0;left:50%;border-radius:3px}
+  .wlrow .bar i.u{background:var(--up)}.wlrow .bar i.d{background:var(--down)}
+  .wl .wlnote{padding:7px 12px;color:var(--dim);font-size:11.5px;border-top:1px solid var(--line2);
+    background:#fafbfc;display:none}
+  .wl .wlnote.show{display:block}
+  .wl .sess{font-size:10.5px;padding:1px 6px;border-radius:4px;background:#f3f4f6;color:var(--dim)}
+  .wl .sess.live{background:#fef2f2;color:#b91c1c}
 </style>
 </head>
 <body>
@@ -168,6 +195,8 @@
   </section>
 </main>
 
+<section id="wlsec" class="wlsec"></section>
+
 <section class="panel" style="margin:0 12px 12px">
   <div class="phead">进出榜流水
     <span class="sub">记录进出「成交额前 30」的瞬时变动</span>
@@ -181,6 +210,8 @@
   数据源：东方财富（全市场成交额榜单）· 新浪财经（60 分钟 K 线，约 147 个交易日）· 腾讯行情（实时快照）·
   NASDAQ / CNBC（备选实时报价，含盘前盘后）。全部免费、无需 API Key、非官方 SLA。<br>
   K 线时间轴为<b>美东时间</b>。美股未开盘时展示的即为历史行情（最后一根＝上一交易日收盘）。
+  自选框的「当前 60 分钟 K 线涨跌幅」= 用<b>实时价</b>补齐正在走（未走完，图上为虚线蜡烛）的那根 60 分钟 K 线，
+  基准为该根的上一根收盘。<b>自选框只在盘中（09:30–16:00 ET）加载</b>，盘前/盘后一律不显示。<br>
   行情为准实时，仅供个人研究，不构成投资建议。<br>
   颜色约定：<span class="u">红涨</span> / <span class="d">绿跌</span>（与 A 股一致，与美股相反）。
 </div>
@@ -188,7 +219,7 @@
 <script>
 const S = {
   cfg: null, items: [], kl: {}, cur: null, timerBoard: null, timerKl: null, timerDetail: null,
-  feed: [], boardCd: 0, priceCd: 0,
+  feed: [], boardCd: 0, priceCd: 0, wl: null, timerWl: null,
   chartBars: 21          // K 线图默认画多少根：21 根 = 3 个交易日（每天 7 根 60 分钟）
 };
 
@@ -266,6 +297,10 @@ function renderRows(){
   tb.querySelectorAll('tr[data-sym]').forEach(tr => {
     tr.onclick = () => selectSymbol(tr.dataset.sym);
   });
+  // 自选框里若有同一标的，同步选中态
+  document.querySelectorAll('#wlsec .wlrow[data-sym]').forEach(el => {
+    el.classList.toggle('sel', el.dataset.sym === S.cur);
+  });
 }
 
 function renderFeed(){
@@ -277,6 +312,76 @@ function renderFeed(){
       <span class="why">${f.action==='in'?'入榜':'出榜'} · ${esc(f.reason)}</span>
       <span class="dt">${esc(f.detail||'')}</span>
     </div>`).join('');
+}
+
+/* ---------------- 自选框（60上涨 / 60下跌） ---------------- */
+/* 判据由服务端算好：成交额前 30 且「当前 60 分钟 K 线（未走完也算）涨跌幅」超阈值。
+   前端只负责展示 —— 阈值、框数都在 config.json 的 watchlists 里改。
+   ⛔ 只在盘中（09:30–16:00 ET）加载：盘前/盘后/休市一律不请求、不显示。 */
+async function loadWatchlist(){
+  // 本地时段守卫：非盘中直接清空并跳过请求，避免无谓轮询
+  const m = marketState();
+  if(m.state !== '交易中'){
+    if(S.wl && S.wl.is_regular){
+      S.wl = { is_regular:false, session:'', boxes:{} };
+      renderWatchlists();
+    }
+    S.wl = S.wl || { is_regular:false, boxes:{} };
+    return;
+  }
+  try{
+    const r = await fetch('/api/watchlist', {cache:'no-store'});
+    const d = await r.json();
+    S.wl = d;
+    renderWatchlists();
+  }catch(e){ /* 静默：不影响主表 */ }
+}
+
+function renderWatchlists(){
+  const box = $('wlsec');
+  if(!box) return;
+  const wl = S.wl || {};
+  // ⛔ 只认盘中：盘前/盘后/休市整个区域隐藏（服务端此时也不返回名单）
+  if(!wl.is_regular){ box.innerHTML = ''; box.style.display = 'none'; return; }
+  box.style.display = '';
+  const ids = Object.keys(wl.boxes || {});
+  if(!ids.length){ box.innerHTML = ''; return; }
+  const sessTxt = {pre:'盘前', after:'盘后', closed:'休市', regular:'盘中'}[wl.session] || wl.session || '';
+  const isRegular = wl.session === 'regular';
+  box.innerHTML = ids.map(id => {
+    const b = wl.boxes[id];
+    const n = (b.items||[]).length;
+    const rowsHtml = n ? b.items.map(it => {
+      const pctCls = it.pct > 0 ? 'u' : (it.pct < 0 ? 'd' : 'f');
+      // 幅度条：以 0 为中心，最长按 2% 满格
+      const w = Math.min(Math.abs(it.pct)/2*50, 50);
+      const side = it.pct >= 0 ? 'u' : 'd';
+      const left = it.pct >= 0 ? 50 : (50 - w);
+      const doneMark = it.done ? '' : '<span title="该根 60 分钟 K 线尚未走完" style="color:#b45309">*</span>';
+      return `<div class="wlrow ${S.cur===it.symbol?'sel':''}" data-sym="${esc(it.symbol)}">
+        <span class="rk">${it.rank||''}</span>
+        <span class="nm">${esc(it.name||it.symbol)}</span>
+        <span class="sym">${esc(it.symbol)}</span>
+        <span class="grow"></span>
+        <span class="px num">${it.c==null?'—':Number(it.c).toFixed(2)}</span>
+        <span class="bar"><i class="${side}" style="left:${left}%;width:${w}%"></i></span>
+        <span class="pct num ${pctCls}">${sgn(it.pct)}%${doneMark}</span>
+        <span class="dayp num ${cls(it.day_pct)}">日 ${sgn(it.day_pct)}%</span>
+      </div>`;
+    }).join('') : '<div class="empty" style="padding:18px">当前无标的满足条件</div>';
+    return `<section class="panel wl">
+      <div class="phead">${esc(b.name)}
+        <span class="cnt">（${n} 只）</span>
+        <span class="sess ${isRegular?'live':''}">${esc(sessTxt)}</span>
+        <span class="thr">${b.side==='up'?'≥ +':'≤ '}${b.thr}% · 成交额前 ${wl.top_n||30}</span>
+      </div>
+      <div class="wlbody">${rowsHtml}</div>
+      ${wl.note?`<div class="wlnote show">ⓘ ${esc(wl.note)}</div>`:''}
+    </section>`;
+  }).join('');
+  box.querySelectorAll('.wlrow[data-sym]').forEach(el => {
+    el.onclick = () => selectSymbol(el.dataset.sym);
+  });
 }
 
 /* ---------------- 60 分钟 K 线（批量摘要） ---------------- */
@@ -299,6 +404,7 @@ async function loadKlines(){
 async function selectSymbol(sym){
   S.cur = sym;
   renderRows();
+  renderWatchlists();
   await loadDetail();
   if(S.timerDetail) clearInterval(S.timerDetail);
   S.timerDetail = setInterval(loadDetail, 20000);
@@ -321,16 +427,25 @@ async function loadDetail(){
     $('kGap').textContent = sm.mid_gap_pct==null?'—':sgn(sm.mid_gap_pct)+'%';
     $('kGap').className = 'num ' + cls(sm.mid_gap_pct);
     $('kPos').textContent = sm.pos || '—';
-    $('kBar').textContent = sm.bar_chg_pct==null?'—':sgn(sm.bar_chg_pct)+'%';
-    $('kBar').className = 'num ' + cls(sm.bar_chg_pct);
+    // 本根涨跌：优先用「当前（未走完）60 分钟 bar」的实时口径，没有再退回 K 线摘要。
+    // 仅在盘中采用 —— 盘前/盘后没有进行中的 60 分钟 K 线，此时用 K 线摘要口径。
+    const cb = d.cur_bar;
+    const useLive = cb && cb.src === 'live' && cb.session === 'regular';
+    const barPct = useLive ? cb.pct : sm.bar_chg_pct;
+    $('kBar').textContent = barPct==null?'—':sgn(barPct)+'%';
+    $('kBar').className = 'num ' + cls(barPct);
     $('kVol').textContent = sm.vol_ratio==null?'—':sm.vol_ratio.toFixed(2)+'x';
     $('kAmp').textContent = sm.amp==null?'—':Number(sm.amp).toFixed(2)+'%';
     const m = renderMarketState();
     const lastT = (sm.last_bar && sm.last_bar.t) ||
                   (d.bars.length ? d.bars[d.bars.length-1].t : '—');
-    $('chartSub').textContent = (m.isOpen ? '实时行情' : '历史行情')
+    let sub = (m.isOpen ? '实时行情' : '历史行情')
       + ' · 最后 K 线 ' + (lastT || '—') + '（美东时间）· 源 ' + (d.kline_source || '—');
-    drawChart(d.bars || []);
+    if(useLive){
+      sub += ' · 当前根 ' + (cb.t || '') + ' ' + sgn(cb.pct) + '%（未走完，实时价）';
+    }
+    $('chartSub').textContent = sub;
+    drawChart(d.bars || [], cb);
   }catch(e){ /* 静默 */ }
 }
 
@@ -353,12 +468,17 @@ function bollSeries(closes, n, k){
      viewCount 可见窗口根数，默认取 config 里的 chart_bars
      hover     指针停在第几根（窗口内下标，-1 = 没有）
      geom      最近一次绘制的几何参数，供指针反查与缩放换算 */
-const KL = { bars: [], hover: -1, geom: null, viewEnd: 0, viewCount: 21 };
+const KL = { bars: [], hover: -1, geom: null, viewEnd: 0, viewCount: 21, ghost: null };
 let drag = null;   // 鼠标拖动中
 let tch  = null;   // 触摸手势中
 
+/** 图表总根数 = K 线根数 + 幽灵 bar（当前未走完的那根） */
+function viewTotal(){
+  return KL.bars.length + (KL.ghost ? 1 : 0);
+}
+
 function viewReset(){
-  const NB = KL.bars.length;
+  const NB = viewTotal();
   KL.viewCount = Math.max(1, Math.min(S.chartBars || 21, NB || 1));
   KL.viewEnd   = NB;                     // 默认看最新一段
   updateViewInfo();
@@ -367,14 +487,26 @@ function viewReset(){
 function updateViewInfo(){
   const el = $('viewInfo');
   if(!el) return;
-  const NB = KL.bars.length;
-  el.textContent = NB ? ('显示 ' + Math.min(KL.viewCount, NB) + ' / ' + NB + ' 根') : '';
+  const NB = viewTotal();
+  const live = KL.ghost ? '（含 1 根进行中）' : '';
+  el.textContent = NB ? ('显示 ' + Math.min(KL.viewCount, NB) + ' / ' + NB + ' 根' + live) : '';
 }
 
-function drawChart(bars){
+function drawChart(bars, curBar){
   KL.bars = bars || [];
   KL.hover = -1;
+  KL.ghost = null;
   drag = null; tch = null;
+  // 「幽灵 bar」：当前那根未走完的 60 分钟 K 线。
+  // ⛔ 只在盘中画 —— 盘前/盘后那根不是 60 分钟 K 线的延续，画出来会误导。
+  // 只有当它还没出现在 K 线数组里时才单独画（否则会与真实蜡烛重复）。
+  if(curBar && curBar.src === 'live' && curBar.c != null && !curBar.done
+     && curBar.session === 'regular'){
+    const lastT = KL.bars.length ? (KL.bars[KL.bars.length-1].t || '') : '';
+    if(!curBar.t || curBar.t.slice(0,16) !== lastT.slice(0,16)){
+      KL.ghost = curBar;
+    }
+  }
   viewReset();
   hideTip();
   paintChart();
@@ -398,11 +530,19 @@ function paintChart(){
   const closes = bars.map(b=>b.c);
   const B = bollSeries(closes, 20, 2);
   const NB = bars.length;
+  const GH = KL.ghost;                              // 当前未走完的那根（可能为 null）
+  const total = NB + (GH ? 1 : 0);                  // 幽灵 bar 也算一根，参与缩放/平移
   // 可见窗口由视图状态决定（可拖动 / 缩放）；BOLL 始终按全序列算，所以平移缩放后布林线依然有效
-  const SHOW = Math.max(1, Math.min(KL.viewCount || (S.chartBars || 21), NB));
-  const s = Math.max(0, Math.min(KL.viewEnd - SHOW, NB - SHOW));
+  const SHOW = Math.max(1, Math.min(KL.viewCount || (S.chartBars || 21), total));
+  const s = Math.max(0, Math.min(KL.viewEnd - SHOW, total - SHOW));
   KL.viewCount = SHOW; KL.viewEnd = s + SHOW;      // 回写，保证状态与画面一致
-  const seg = bars.slice(s);
+
+  // 取值工具：把「窗口内下标 i」映射到 bars[] 的下标（越界时可能是幽灵 bar）
+  const barAt = i => {
+    const gi = s + i;
+    if(GH && gi >= NB) return GH;
+    return bars[gi];
+  };
 
   const padL=6, padR=54, padT=8, axisH=16, volH=Math.round(H*0.2), gap=12;
   const priceH = H - padT - volH - gap - axisH;
@@ -414,11 +554,15 @@ function paintChart(){
     hi = Math.max(hi, bars[i].h, B.up[i]==null?-Infinity:B.up[i]);
     lo = Math.min(lo, bars[i].l, B.low[i]==null?Infinity:B.low[i]);
   }
+  if(GH && s + SHOW > NB){                          // 幽灵 bar 进入可视区才纳入范围
+    hi = Math.max(hi, GH.h || GH.c); lo = Math.min(lo, GH.l || GH.c);
+  }
   const pad = (hi-lo)*0.06 || 1; hi += pad; lo -= pad;
   const Y = p => padT + (hi-p)/(hi-lo)*priceH;
   const X = i => padL + i*step + step/2;
   // 存几何参数，供 mousemove 反查指针落在哪一根
-  KL.geom = { padL, padR, padT, priceH, volH, volTop: padT+priceH+gap, step, SHOW, s, W, H };
+  KL.geom = { padL, padR, padT, priceH, volH, volTop: padT+priceH+gap, step, SHOW, s, NB,
+              ghostIdx: GH ? NB - s : -1, W, H };
 
   // 网格 + 右侧价格轴
   g.font = '10px sans-serif'; g.textAlign='left'; g.textBaseline='middle';
@@ -442,27 +586,52 @@ function paintChart(){
   line(B.up, '#cbd5e1', 1); line(B.low, '#cbd5e1', 1); line(B.mid, '#2563eb', 1.4);
 
   // 蜡烛
-  const maxV = Math.max(...seg.map(b=>b.amt||0)) || 1;
   const volTop = padT + priceH + gap;
+  const maxV = Math.max(1, ...bars.slice(s).map(b=>b.amt||0), GH?(GH.amt||0):0);
   for(let i=0;i<SHOW;i++){
-    const b = bars[s+i], x = X(i), up = b.c >= b.o;
+    const b = barAt(i);
+    if(!b) continue;
+    const isGhost = (GH && (s+i) >= NB);
+    const x = X(i), up = b.c >= b.o;
     const color = up ? '#d92b2b' : '#0a9b5a';
-    g.strokeStyle = color; g.fillStyle = color; g.lineWidth = 1;
-    g.beginPath(); g.moveTo(x+.5, Y(b.h)); g.lineTo(x+.5, Y(b.l)); g.stroke();
-    const y1 = Y(Math.max(b.o,b.c)), y2 = Y(Math.min(b.o,b.c));
-    g.fillRect(x-cw/2, y1, cw, Math.max(1, y2-y1));
-    // 成交量
-    const vh = (b.amt||0)/maxV*volH;
-    g.globalAlpha = .5;
-    g.fillRect(x-cw/2, volTop+volH-vh, cw, Math.max(1, vh));
-    g.globalAlpha = 1;
+    if(isGhost){
+      // 未走完的那根：半透明 + 虚线，一眼区分「正在走」和「已走完」
+      g.save();
+      g.globalAlpha = .55;
+      g.strokeStyle = color; g.fillStyle = color; g.lineWidth = 1;
+      g.setLineDash([2,2]);
+      g.beginPath(); g.moveTo(x+.5, Y(b.h)); g.lineTo(x+.5, Y(b.l)); g.stroke();
+      g.setLineDash([]);
+      const gy1 = Y(Math.max(b.o,b.c)), gy2 = Y(Math.min(b.o,b.c));
+      g.fillRect(x-cw/2, gy1, cw, Math.max(1, gy2-gy1));
+      // 虚线框，强调「未走完」
+      g.globalAlpha = .9; g.setLineDash([2,2]);
+      g.strokeRect(x-cw/2-1, Y(b.h)-1, cw+2, Math.max(3, Y(b.l)-Y(b.h))+2);
+      g.setLineDash([]);
+      const gvh = (b.amt||0)/maxV*volH;
+      g.globalAlpha = .3;
+      g.fillRect(x-cw/2, volTop+volH-gvh, cw, Math.max(1, gvh));
+      g.restore();
+    }else{
+      g.strokeStyle = color; g.fillStyle = color; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x+.5, Y(b.h)); g.lineTo(x+.5, Y(b.l)); g.stroke();
+      const y1 = Y(Math.max(b.o,b.c)), y2 = Y(Math.min(b.o,b.c));
+      g.fillRect(x-cw/2, y1, cw, Math.max(1, y2-y1));
+      // 成交量
+      const vh = (b.amt||0)/maxV*volH;
+      g.globalAlpha = .5;
+      g.fillRect(x-cw/2, volTop+volH-vh, cw, Math.max(1, vh));
+      g.globalAlpha = 1;
+    }
   }
 
   // 时间轴（美东时间）
   g.fillStyle = '#9ca3af'; g.textAlign='center'; g.textBaseline='top';
   const tstep = Math.max(1, Math.floor(SHOW/6));
   for(let i=0;i<SHOW;i+=tstep){
-    const t = (bars[s+i].t||'').slice(5);               // MM-DD HH:MM
+    const bb = barAt(i); if(!bb) continue;
+    let t = (bb.t||'').slice(5);                        // MM-DD HH:MM
+    if(!t && GH && bb === GH) t = '进行中';
     g.fillText(t, X(i), volTop+volH+3);
   }
 
@@ -477,7 +646,9 @@ function paintChart(){
   // ---- 十字光标：标出指针停留的那根 K 线 ----
   const hv = KL.hover;
   if(hv >= 0 && hv < SHOW){
-    const hb = bars[s+hv], hx = X(hv), hy = Math.round(Y(hb.c)) + .5;
+    const hb = barAt(hv);
+    if(!hb){ /* 越界不画 */ }else{
+    const hx = X(hv), hy = Math.round(Y(hb.c)) + .5;
     g.save();
     g.setLineDash([3,3]); g.lineWidth = 1; g.strokeStyle = '#94a3b8';
     g.beginPath(); g.moveTo(hx+.5, padT); g.lineTo(hx+.5, volTop+volH); g.stroke();
@@ -492,11 +663,13 @@ function paintChart(){
     g.fillStyle = '#fff'; g.font = '10px sans-serif'; g.textAlign='left'; g.textBaseline='middle';
     g.fillText(hb.c.toFixed(2), W-padR+5, hy);
     // 底部时间高亮
-    const lbl = (hb.t||'').slice(5);
+    let lbl = (hb.t||'').slice(5);
+    if(!lbl && GH && hb === GH) lbl = '进行中';
     g.font = '10px sans-serif'; g.textAlign='center'; g.textBaseline='top';
     const lw = g.measureText(lbl).width + 10;
     g.fillStyle = '#1f2937'; g.fillRect(hx-lw/2, volTop+volH+1, lw, 14);
     g.fillStyle = '#fff'; g.fillText(lbl, hx, volTop+volH+3);
+    }
   }
 
   updateViewInfo();
@@ -506,13 +679,16 @@ function paintChart(){
 function hideTip(){ const t = $('kltip'); if(t) t.classList.remove('show'); }
 
 function showTip(i, clientX, clientY){
-  const gm = KL.geom, bars = KL.bars, tip = $('kltip');
+  const gm = KL.geom, bars = KL.bars, tip = $('kltip'), GH = KL.ghost;
   if(!gm || !tip) return;
-  const bi = gm.s + i, b = bars[bi];
+  const gi = gm.s + i;
+  const b  = (GH && gi >= bars.length) ? GH : bars[gi];
   if(!b){ hideTip(); return; }
+  const isGhost = (GH && gi >= bars.length);
 
   // 涨跌一律相对「前一根收盘」算，与行情软件口径一致
-  const prev = bi > 0 ? bars[bi-1] : null;
+  const prev = isGhost ? (bars.length ? bars[bars.length-1] : null)
+                       : (gi > 0 ? bars[gi-1] : null);
   const chg  = prev ? b.c - prev.c : null;
   const pct  = (prev && prev.c) ? (b.c/prev.c - 1) * 100 : null;
   const amp  = (prev && prev.c) ? (b.h - b.l) / prev.c * 100 : null;
@@ -520,11 +696,12 @@ function showTip(i, clientX, clientY){
   const sg   = (v, d=2) => (v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(d));
 
   tip.innerHTML =
-    '<div class="t">' + esc(b.t) + '<i>美东时间</i></div>' +
+    '<div class="t">' + (isGhost ? '当前（未走完）' : esc(b.t)) +
+      '<i>' + (isGhost ? '实时价' : '美东时间') + '</i></div>' +
     '<div class="r"><span>开</span><b class="num">' + b.o.toFixed(2) + '</b></div>' +
     '<div class="r"><span>高</span><b class="num">' + b.h.toFixed(2) + '</b></div>' +
     '<div class="r"><span>低</span><b class="num">' + b.l.toFixed(2) + '</b></div>' +
-    '<div class="r"><span>收</span><b class="num ' + cls(pct) + '">' + b.c.toFixed(2) + '</b></div>' +
+    '<div class="r"><span>' + (isGhost ? '现价' : '收') + '</span><b class="num ' + cls(pct) + '">' + b.c.toFixed(2) + '</b></div>' +
     '<div class="r"><span>涨跌</span><b class="num ' + cls(pct) + '">' + sg(chg) + '　' + sg(pct) + '%</b></div>' +
     '<div class="r"><span>振幅</span><b class="num">' + (amp == null ? '—' : amp.toFixed(2) + '%') + '</b></div>' +
     '<div class="r"><span>成交量</span><b class="num">' + fmtVol(b.v) + '</b></div>' +
@@ -562,7 +739,7 @@ const VMIN = 8;                    // 最少显示 8 根，再少就看不出形
 
 /** 把 viewCount / viewEnd 收回合法区间，保证永远不越出数据范围 */
 function viewClamp(){
-  const NB = KL.bars.length;
+  const NB = viewTotal();
   if(!NB) return;
   const minC = Math.max(1, Math.min(VMIN, NB));
   KL.viewCount = Math.max(minC, Math.min(Math.round(KL.viewCount), NB));
@@ -573,7 +750,7 @@ function viewClamp(){
 function zoomAt(clientX, factor){
   const gm = KL.geom;
   if(!gm || !KL.bars.length) return;
-  const NB = KL.bars.length;
+  const NB = viewTotal();
   const rx = clientX - $('chart').getBoundingClientRect().left;
   const iAnchor  = (rx - gm.padL) / gm.step;              // 锚点在窗口内的浮点下标
   const gAnchor  = KL.viewEnd - KL.viewCount + iAnchor;   // 换算成全局下标
@@ -649,7 +826,7 @@ function onTouchMove(e){
   if(tch.mode === 'pan' && e.touches.length === 1){
     KL.viewEnd = tch.end - pxToBars(e.touches[0].clientX - tch.x);
   }else if(tch.mode === 'zoom' && e.touches.length === 2){
-    const NB = KL.bars.length;
+    const NB = viewTotal();
     let nc = Math.round(tch.c0 / (tDist(e) / tch.d0));    // 两指张开 = 放大 = 根数变少
     nc = Math.max(Math.max(1, Math.min(VMIN, NB)), Math.min(nc, NB));
     const newStep = (gm.W - gm.padL - gm.padR) / nc;
@@ -746,6 +923,7 @@ async function boot(){
   await loadBoard(true);
   S.boardCd = boardSec; S.priceCd = priceSec;
   await loadKlines();
+  await loadWatchlist();                          // 内部自带时段守卫：非盘中不请求
   await loadHealth();
   if(S.items.length) selectSymbol(S.items[0].symbol);
 
@@ -755,10 +933,11 @@ async function boot(){
   setInterval(() => { S.priceCd = priceSec; loadBoard(true); }, priceSec*1000);
   setInterval(() => { S.boardCd = boardSec; }, boardSec*1000);
   setInterval(loadKlines, klSec*1000);
+  setInterval(loadWatchlist, priceSec*1000);      // 自选框跟着价格节奏刷（内部会判断盘中）
   setInterval(loadHealth, 5000);
 
   $('btnNow').onclick = () => { S.boardCd = boardSec; S.priceCd = priceSec;
-    loadBoard(true).then(loadKlines).then(loadHealth); };
+    loadBoard(true).then(loadKlines).then(loadWatchlist).then(loadHealth); };
   $('btnClear').onclick = () => { S.feed = []; renderFeed(); };
 
   // K 线交互：悬停看单根详情 · 滚轮缩放 · 拖动平移 · 双击复位 · 触屏单指平移/双指缩放

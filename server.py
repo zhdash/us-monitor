@@ -8,6 +8,7 @@ API
     GET /                   前端页面
     GET /api/board          成交额 TOP N 榜单（含进出榜流水）
     GET /api/klines         批量 60 分钟 K 线摘要（默认取榜单内全部标的）
+    GET /api/watchlist      自选框：60上涨 / 60下跌（当前 60 分钟 K 线涨跌过滤）
     GET /api/detail?symbol= 单只：K 线全文 + 实时报价
     GET /api/health         数据源健康状态（含风控冷却倒计时）
     GET /api/config         前端需要的配置
@@ -31,6 +32,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 from datasource import MarketData                      # noqa: E402
+from current_bar import resolve_current_bar, session_of, et_now   # noqa: E402
 from indicators import summarize                       # noqa: E402
 from rules import default_rules, evaluate               # noqa: E402
 
@@ -134,6 +136,7 @@ class Monitor:
             summ["tz"] = kl.get("tz", "ET")
             summ["last_t"] = (kl["bars"][-1] or {}).get("t")
             summ["tags"] = evaluate(it, summ, tag_rules)
+            summ["_bars"] = kl["bars"]        # 留给自选框复用，省一次回源
             data[it["symbol"]] = summ
         with self._lock:
             self._kl.update(data)
@@ -151,6 +154,117 @@ class Monitor:
                 "missing": missing, "cached": sorted(self._kl.keys()),
                 "period": self.cfg.get("kline", {}).get("period", 60)}
 
+    # ---------------- 自选框（清单） ---------------- #
+    def watchlists(self) -> dict:
+        """按「自选框」条件从成交额前 N 里筛标的。
+
+        每个框由 config.json 的 `watchlists` 段落驱动，一条 = 一个框：
+
+            "up60":   { "name": "60上涨", "enabled": true, "side": "up",   "thr": 0.5 }
+            "down60": { "name": "60下跌", "enabled": true, "side": "down", "thr": 0.5 }
+
+        side=up    ⇒ 当前 60 分钟涨跌幅 ≥ +thr 入框
+        side=down  ⇒ 当前 60 分钟涨跌幅 ≤ -thr 入框
+
+        「当前 60 分钟涨跌幅」的准确定义见 current_bar.py —— 核心是**用实时价补齐
+        正在走（未走完）的那根 60 分钟 K 线**，而不是直接读 K 线数组最后一根
+        （新浪盘前/盘中不返回进行中的那根，会退化成上一交易日收盘）。
+
+        加一个新框 = 在 config.json 里加一行 + 这里不用改。（后续要更复杂的条件时，
+        把 match 换成可注册的判定函数即可。）
+        """
+        with self._lock:
+            items = list(self._last_items)
+        wl_cfg = self.cfg.get("watchlists") or {}
+        boxes = {k: v for k, v in wl_cfg.items()
+                 if isinstance(v, dict) and v.get("enabled", True)
+                 and not k.startswith("_comment")}
+        sess = session_of()
+        out = {"ok": False, "session": sess, "is_regular": sess == "regular",
+               "et": et_now().strftime("%Y-%m-%d %H:%M"),
+               "top_n": self.top_n, "boxes": {}, "note": "", "count": 0}
+        for k in boxes:
+            out["boxes"][k] = {"id": k, "name": boxes[k].get("name", k),
+                               "side": boxes[k].get("side", "up"),
+                               "thr": float(boxes[k].get("thr", 0.5)),
+                               "items": []}
+
+        # ⛔ 只认盘中：盘前/盘后/休市一律不加载、不刷新（连实时价和 K 线都不取）。
+        #    理由（老大 2026-10-08 要求）：那两个时段的「涨跌幅」不是 60 分钟 K 线口径，
+        #    会给出与盘中含义完全不同的名单，容易误读。
+        if sess != "regular":
+            cn = {"pre": "盘前", "after": "盘后", "closed": "休市"}.get(sess, sess)
+            out["note"] = "%s不加载自选框（只在盘中 09:30–16:00 ET 有效）。" % cn
+            return out
+        if not items:
+            out["note"] = "榜单尚未就绪，自选框暂时无数据"
+            return out
+
+        # 实时价（新浪优先，盘前/盘中/盘后都有值；腾讯兜底）
+        live = self.md.quotes_now([it["symbol"] for it in items])
+
+        # 拿 K 线：优先复用 klines() 已经缓存好的（含完整 bars），缺的补取
+        with self._lock:
+            cached = dict(self._kl)
+        need = [it for it in items
+                if not (cached.get(it["symbol"], {}) or {}).get("_bars")]
+        if need:
+            raw = self.md.klines60(need)
+            for it in need:
+                kl = raw.get(it["symbol"])
+                if kl and kl.get("bars"):
+                    summ = summarize(kl["bars"], self.cfg.get("indicators", {}).get("boll", {}))
+                    summ["klt"] = kl.get("klt", 60)
+                    summ["tz"] = kl.get("tz", "ET")
+                    summ["last_t"] = kl["bars"][-1].get("t")
+                    summ["_bars"] = kl["bars"]
+                    with self._lock:
+                        self._kl[it["symbol"]] = summ
+
+        # 组装每只的「当前 bar」
+        stock = {}
+        for it in items:
+            sym = it["symbol"]
+            q = live.get(sym) or {}
+            lp = q.get("price")
+            with self._lock:
+                row = self._kl.get(sym) or {}
+            bars = row.get("_bars")
+            if not bars:
+                continue
+            cur = resolve_current_bar(bars, lp)
+            if not cur:
+                continue
+            cur["symbol"] = sym
+            cur["source"] = q.get("source")
+            cur["live_ts"] = q.get("ts_text")
+            cur["name"] = it.get("name")
+            cur["amount"] = it.get("amount")
+            cur["rank"] = it.get("rank")
+            cur["price"] = it.get("price")
+            cur["day_pct"] = it.get("pct")
+            if q.get("pct_1h") is not None:
+                cur["pct_1h"] = q["pct_1h"]     # 新浪口径的「最近 1 小时涨跌幅」，仅参考
+            stock[sym] = cur
+
+        # 分框
+        for k, meta in out["boxes"].items():
+            side, thr = meta["side"], meta["thr"]
+            hits = []
+            for sym, cur in stock.items():
+                p = cur["pct"]
+                if side == "up" and p >= thr:
+                    hits.append(cur)
+                elif side == "down" and p <= -thr:
+                    hits.append(cur)
+            hits.sort(key=lambda r: r["pct"], reverse=(side == "up"))
+            meta["items"] = hits
+        out["ok"] = True
+        out["count"] = len(stock)
+        out["note"] = ("盘中 %s ET ｜ 成交额前 %d 内，当前 60 分钟 K 线（未走完按实时价算）涨跌幅达标"
+                       % (out["et"], self.top_n))
+        return out
+
     # ---------------- 单只详情 ---------------- #
     def detail(self, symbol: str) -> dict:
         with self._lock:
@@ -164,8 +278,16 @@ class Monitor:
         summ = summarize((bars or {}).get("bars") or [],
                          self.cfg.get("indicators", {}).get("boll", {}))
         rt = self.md.realtime(symbol, (item or {}).get("name", ""))
+        # 当前（可能未走完）的 60 分钟 bar：收盘端用实时价，供图表叠加绘制
+        live = self.md.quotes_now([symbol]).get(symbol) or {}
+        cur = resolve_current_bar((bars or {}).get("bars") or [],
+                                  live.get("price"), et_now())
+        if cur:
+            cur["source"] = live.get("source")
+            cur["live_ts"] = live.get("ts_text")
         return {"ok": bool(bars), "symbol": symbol, "item": item,
                 "bars": (bars or {}).get("bars") or [], "summary": summ,
+                "cur_bar": cur,
                 "tz": (bars or {}).get("tz", "ET"),
                 "kline_source": "新浪" if (bars or {}).get("tz") == "ET" else "东财",
                 "realtime": rt}
@@ -225,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/klines":
                 syms = (q.get("symbols") or [""])[0]
                 return self._json(self.monitor.klines([s for s in syms.split(",") if s] or None))
+            if path == "/api/watchlist":
+                return self._json(self.monitor.watchlists())
             if path == "/api/detail":
                 sym = (q.get("symbol") or [""])[0].strip().upper()
                 if not sym:
