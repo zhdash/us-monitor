@@ -128,6 +128,9 @@
   .wl .wlnote.show{display:block}
   .wl .sess{font-size:10.5px;padding:1px 6px;border-radius:4px;background:#f3f4f6;color:var(--dim)}
   .wl .sess.live{background:#fef2f2;color:#b91c1c}
+  .wl .sess.ext{background:#fffbeb;color:#b45309}
+  .wl.wlExt .phead{border-bottom-color:#fde68a}
+  .wl.wlExt .wlnote{background:#fffbeb;color:var(--warn);border-top-color:#fde68a}
 </style>
 </head>
 <body>
@@ -219,7 +222,7 @@
 <script>
 const S = {
   cfg: null, items: [], kl: {}, cur: null, timerBoard: null, timerKl: null, timerDetail: null,
-  feed: [], boardCd: 0, priceCd: 0, wl: null, timerWl: null,
+  feed: [], boardCd: 0, priceCd: 0, wl: null, timerWl: null, session: null,
   chartBars: 21          // K 线图默认画多少根：21 根 = 3 个交易日（每天 7 根 60 分钟）
 };
 
@@ -317,22 +320,16 @@ function renderFeed(){
 /* ---------------- 自选框（60上涨 / 60下跌） ---------------- */
 /* 判据由服务端算好：成交额前 30 且「当前 60 分钟 K 线（未走完也算）涨跌幅」超阈值。
    前端只负责展示 —— 阈值、框数都在 config.json 的 watchlists 里改。
-   ⛔ 只在盘中（09:30–16:00 ET）加载：盘前/盘后/休市一律不请求、不显示。 */
+   盘前/盘后照常显示（框上标时段），只有周末休市才隐藏。 */
 async function loadWatchlist(){
-  // 本地时段守卫：非盘中直接清空并跳过请求，避免无谓轮询
-  const m = marketState();
-  if(m.state !== '交易中'){
-    if(S.wl && S.wl.is_regular){
-      S.wl = { is_regular:false, session:'', boxes:{} };
-      renderWatchlists();
-    }
-    S.wl = S.wl || { is_regular:false, boxes:{} };
-    return;
-  }
+  // ⭐ 只认盘中：非盘中**根本不请求**，避免盘前/盘后数据进入前端状态。
+  if(S.session && S.session !== 'regular'){ S.wl = null; renderWatchlists(); return; }
   try{
     const r = await fetch('/api/watchlist', {cache:'no-store'});
     const d = await r.json();
+    S.session = d.session;                       // 服务端时段以服务器为准
     S.wl = d;
+    if(d.session !== 'regular'){ S.wl = null; }
     renderWatchlists();
   }catch(e){ /* 静默：不影响主表 */ }
 }
@@ -341,12 +338,12 @@ function renderWatchlists(){
   const box = $('wlsec');
   if(!box) return;
   const wl = S.wl || {};
-  // ⛔ 只认盘中：盘前/盘后/休市整个区域隐藏（服务端此时也不返回名单）
-  if(!wl.is_regular){ box.innerHTML = ''; box.style.display = 'none'; return; }
+  // ⭐ 2026-10-08 老大定调：只展示盘中数据。盘前/盘后/休市整块隐藏。
+  if(wl.session !== 'regular'){ box.innerHTML = ''; box.style.display = 'none'; return; }
   box.style.display = '';
   const ids = Object.keys(wl.boxes || {});
   if(!ids.length){ box.innerHTML = ''; return; }
-  const sessTxt = {pre:'盘前', after:'盘后', closed:'休市', regular:'盘中'}[wl.session] || wl.session || '';
+  const sessTxt = {pre:'盘前', after:'盘后', regular:'盘中'}[wl.session] || wl.session || '';
   const isRegular = wl.session === 'regular';
   box.innerHTML = ids.map(id => {
     const b = wl.boxes[id];
@@ -357,7 +354,7 @@ function renderWatchlists(){
       const w = Math.min(Math.abs(it.pct)/2*50, 50);
       const side = it.pct >= 0 ? 'u' : 'd';
       const left = it.pct >= 0 ? 50 : (50 - w);
-      const doneMark = it.done ? '' : '<span title="该根 60 分钟 K 线尚未走完" style="color:#b45309">*</span>';
+      const doneMark = (it.done || !isRegular) ? '' : '<span title="该根 60 分钟 K 线尚未走完" style="color:#b45309">*</span>';
       return `<div class="wlrow ${S.cur===it.symbol?'sel':''}" data-sym="${esc(it.symbol)}">
         <span class="rk">${it.rank||''}</span>
         <span class="nm">${esc(it.name||it.symbol)}</span>
@@ -368,11 +365,11 @@ function renderWatchlists(){
         <span class="pct num ${pctCls}">${sgn(it.pct)}%${doneMark}</span>
         <span class="dayp num ${cls(it.day_pct)}">日 ${sgn(it.day_pct)}%</span>
       </div>`;
-    }).join('') : '<div class="empty" style="padding:18px">当前无标的满足条件</div>';
-    return `<section class="panel wl">
+    }).join('') : `<div class="empty" style="padding:18px">当前无标的满足条件${wl.max_abs_pct!=null?`（全榜最大幅度仅 ${sgn(wl.max_abs_pct.pct)}% · ${esc(wl.max_abs_pct.symbol)}）`:''}</div>`;
+    return `<section class="panel wl${isRegular?'':' wlExt'}">
       <div class="phead">${esc(b.name)}
         <span class="cnt">（${n} 只）</span>
-        <span class="sess ${isRegular?'live':''}">${esc(sessTxt)}</span>
+        <span class="sess ${isRegular?'live':'ext'}">${esc(sessTxt)}</span>
         <span class="thr">${b.side==='up'?'≥ +':'≤ '}${b.thr}% · 成交额前 ${wl.top_n||30}</span>
       </div>
       <div class="wlbody">${rowsHtml}</div>

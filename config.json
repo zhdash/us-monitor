@@ -47,9 +47,14 @@
     "boll_break": { "enabled": false, "side": "mid" }
   },
 
-  "_comment_watchlists": "自选框。每个框一条，判据 = 『在成交额前 top_n 内』且『当前 60 分钟 K 线（未走完也算）涨跌幅』超过阈值。加新框 = 在这里加一行，server / 前端都不用改。side: up=涨幅≥thr，down=跌幅≤-thr。",
+  "_comment_watchlists": "自选框。每个框一条，判据 = 『在成交额前 top_n 内』且『当前 60 分钟 K 线（未走完也算）涨跌幅』超过阈值。加新框 = 在这里加一行，server / 前端都不用改。side: up=涨幅≥thr，down=跌幅≤-thr。⚠️ 只在**盘中**（09:30–16:00 ET）生效并展示；盘前/盘后/休市一律不加载、不显示。",
   "watchlists": {
     "up60":   { "name": "60上涨", "enabled": true, "side": "up",   "thr": 0.5 },
     "down60": { "name": "60下跌", "enabled": true, "side": "down", "thr": 0.5 }
+  },
+
+  "_comment_session": "时段策略。only_regular=true ⇒ 全工具只认盘中数据：盘前/盘后/休市时价格钉在最近一次盘中收盘、涨跌幅为 0、不给「当前未走完的 bar」、自选框整块隐藏。",
+  "session": {
+    "only_regular": true
   }
 }

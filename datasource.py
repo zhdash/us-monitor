@@ -27,6 +27,16 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from universe import BUILTIN_UNIVERSE
+from current_bar import session_of
+
+
+def _in_regular_session() -> bool:
+    """当前是否在**盘中**（09:30–16:00 ET，工作日）。
+
+    老大 2026-10-08 定调：本工具只认盘中数据 —— 盘前/盘后/休市时价格一律钉在
+    最近一次盘中收盘，不做任何盘前/盘后的刷新（见 `enrich`）。
+    """
+    return session_of() == "regular"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -658,15 +668,21 @@ class SinaQuoteSource:
           对应的实时价，秒级跳动），p[21] 给了最近一小时涨幅。
 
     实测字段（`gb_aapl` = 苹果，0-based，2026-10-08 07:32 ET 取样）：
-        0  名称(中文)      1  最新价(盘前/盘中/盘后，实时)   2  涨跌幅% (相对昨收)
+        0  名称(中文)      1  最新价(盘前/盘中/盘后，实时)   2  涨跌幅%（基准见下⚠️）
         3  行情时间(北京)  4  涨跌额                      5  开盘
         6  最高            7  最低                        8  52周高
         9  52周低          10 成交量(累计)                11 10日均量
         12 市值            13 每股收益                   14 PE
         19 最近1小时成交额 ← 用它判断「这根 60 分钟 bar 走了多少量」
         21 最近1小时价    22 最近1小时涨跌幅%           23 最近1小时涨跌额
-        24 行情时间(ET)   25 上一交易日收盘时间(ET)      26 上一交易日收盘价 ← 涨跌基准
+        24 行情时间(ET)   25 上一交易日收盘时间(ET)      26 「昨收」（⚠️ 盘前滞后一天）
         30 最近1小时成交额(另一口径，实测与 19 略有出入)
+
+    ⚠️⚠️ **只有 p[1]（实时价）可信**。2026-10-08 实测：盘前请求时 p[26] 给的是
+    **前前一日**的收盘（MU 报 1045.56 = 10-06 收盘，而 10-07 真实收盘是 1087.835），
+    p[2]/p[4] 基于这个错误基准算出来（MU 显示 +4.06%，真实仅 +0.015%）。腾讯快照
+    的 p[4] 有同样的毛病。⇒ **昨收一律以 60 分钟 K 线尾部的收盘价为准**
+    （`server.Monitor._fix_rt_baseline` / `current_bar.resolve_current_bar` 都这么做）。
 
     限制：非公开文档；字段位置靠约定；**ETF 也覆盖**（SPY/QQQ/IVV 实测通过）。
     """
@@ -718,17 +734,19 @@ class SinaQuoteSource:
                 got[sym] = {
                     "symbol": sym, "source": self.NAME,
                     "name": p[0] or None,
-                    "price": self._f(p, 1),                # 盘前/盘中/盘后实时价
-                    "pct": self._f(p, 2),                  # 相对上一交易日收盘
-                    "chg": self._f(p, 4),
+                    "price": self._f(p, 1),                # 盘前/盘中/盘后实时价 ← 唯一可信字段
+                    # ⚠️ p[2]/p[4]/p[26] 在**盘前时段基准滞后一天**（见下方注释），
+                    # 一律加 `raw_` 前缀标明「原样透传、不可直接用于涨跌幅」。
+                    "raw_pct": self._f(p, 2),              # 相对（错误的）昨收，勿用
+                    "raw_chg": self._f(p, 4),
+                    "raw_prev_close": self._f(p, 26),
                     "open": self._f(p, 5), "high": self._f(p, 6), "low": self._f(p, 7),
                     "volume": self._f(p, 10),
                     "amount_1h": self._f(p, 30) or self._f(p, 19),   # 最近 1 小时成交额
                     "px_1h": self._f(p, 21),               # 最近 1 小时价
-                    "pct_1h": self._f(p, 22),              # 最近 1 小时涨跌幅
-                    "prev_close": self._f(p, 26),          # 上一交易日收盘价
+                    "pct_1h": self._f(p, 22),              # 最近 1 小时涨跌幅（同源，参考）
                     "ts_text": p[24] if len(p) > 24 else None,       # 行情时间（ET）
-                    "prev_ts_text": p[25] if len(p) > 25 else None,  # 上一交易日收盘时间
+                    "prev_ts_text": p[25] if len(p) > 25 else None,  # 该源自称的上一收盘时间
                     "ts": time.time(),
                 }
             self._cache.put(key, got)
@@ -853,20 +871,76 @@ class MarketData:
         """用腾讯快照把榜单里的价格类字段刷新成实时的。
 
         榜单 60 秒才取一次（受东财风控约束），但价格必须是最新的 —— 这一层不可或缺。
+
+        ⚠️ 昨收/涨跌幅**不采信腾讯快照**（2026-10-08 实测：盘前 p[4] 给的是前前一日
+        收盘，MU 报 1045.56，真实为 1087.835 ⇒ 涨跌幅从 +0.02% 错成 +4.06%）。
+        这里先从 60 分钟 K 线拿正确的「最后一根收盘」（= 真实昨收）来重算 pct/chg；
+        K 线取不到时才退回腾讯原值（并标注 `pct_src=tx_raw` 以示不可比）。
+
+        ⭐ 2026-10-08 老大定调「**只看盘中**」：
+          * 盘中（09:30–16:00 ET）：正常用实时价刷新，pct = 现价 vs 上一根收盘。
+          * 盘前/盘后/休市：**不使用盘前/盘后报价当现价**，价格一律钉在「最近一次
+            盘中收盘」（K 线最后一根），此时 pct 恒为 0（因为现价就是昨收）。
+            这样页面不会出现盘前跳动的数字，也不会有「盘前涨跌」这种假信号。
         """
         if not items:
             return items
-        snap = self.tx.quotes([it["symbol"] for it in items], ttl=self.quote_ttl)
+        syms = [it["symbol"] for it in items]
+        snap = self.tx.quotes(syms, ttl=self.quote_ttl)
+        bases = self._last_closes(syms)
+        intraday = _in_regular_session()
         for it in items:
             q = snap.get(it["symbol"])
+            base = bases.get(it["symbol"])
+            # --- 盘前/盘后/休市：价格钉在最近一次盘中收盘 ---
+            if not intraday:
+                if base:
+                    it["price"] = base["c"]
+                    it["prev_close"] = base["c"]
+                    it["prev_close_t"] = base["t"]
+                    it["chg"] = 0.0
+                    it["pct"] = 0.0
+                    it["pct_src"] = "last_intraday_close"
+                    it["rt"] = {"source": "最近盘中收盘", "ts": base.get("t")}
+                continue
             if not q:
                 continue
-            for k in ("price", "pct", "chg", "volume", "amount", "high", "low",
-                      "open", "prev_close"):
+            for k in ("price", "volume", "amount", "high", "low", "open"):
                 if q.get(k) is not None:
                     it[k] = q[k]
             it["rt"] = {"source": q["source"], "ts": q.get("ts_text")}
+            if base and q.get("price") is not None:
+                it["prev_close"] = base["c"]
+                it["prev_close_t"] = base["t"]
+                it["chg"] = round(q["price"] - base["c"], 4)
+                it["pct"] = round((q["price"] / base["c"] - 1) * 100, 3)
+                it["pct_src"] = "kline"
+            else:
+                for k in ("pct", "chg", "prev_close"):
+                    if q.get(k) is not None:
+                        it[k] = q[k]
+                it["pct_src"] = "tx_raw"
         return items
+
+    def _last_closes(self, symbols: list[str]) -> dict[str, dict]:
+        """批量取每只「60 分钟 K 线最后一根」的 {t, c} —— 用作**可信的昨收基准**。
+
+        60 分钟 K 线尾部的收盘价经交叉验证就是上一交易日收盘（见 README 的踩坑记录），
+        所以拿它当涨跌幅分母，与自选框的 pct 同口径。
+
+        实现走 `klines60()`（内部已有 4 并发 + 25 秒缓存），比逐只串行请求快得多；
+        只保留最后一根，省内存。
+        """
+        out: dict[str, dict] = {}
+        try:
+            raw = self.klines60([{"symbol": s, "market": 105} for s in symbols])
+        except Exception:
+            return out
+        for sym, kl in (raw or {}).items():
+            bars = (kl or {}).get("bars") or []
+            if bars:
+                out[sym] = {"t": bars[-1].get("t"), "c": bars[-1].get("c")}
+        return out
 
     # ---------------- K 线 ---------------- #
     def kline_one(self, symbol: str, market: int | None = None,
