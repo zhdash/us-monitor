@@ -868,47 +868,47 @@ class MarketData:
 
     # ---------------- 实时价格回填 ---------------- #
     def enrich(self, items: list[dict]) -> list[dict]:
-        """用腾讯快照把榜单里的价格类字段刷新成实时的。
+        """用实时报价把榜单里的价格类字段刷新成最新的。
 
         榜单 60 秒才取一次（受东财风控约束），但价格必须是最新的 —— 这一层不可或缺。
 
-        ⚠️ 昨收/涨跌幅**不采信腾讯快照**（2026-10-08 实测：盘前 p[4] 给的是前前一日
-        收盘，MU 报 1045.56，真实为 1087.835 ⇒ 涨跌幅从 +0.02% 错成 +4.06%）。
-        这里先从 60 分钟 K 线拿正确的「最后一根收盘」（= 真实昨收）来重算 pct/chg；
-        K 线取不到时才退回腾讯原值（并标注 `pct_src=tx_raw` 以示不可比）。
+        ⚠️ **昨收/涨跌幅一律不采信报价源自带的基准**（2026-10-08 实测：盘前腾讯 p[4] 与
+        新浪 p[26] 给的都是**前前一日**收盘，MU 报 1045.56，真实为 1087.835 ⇒ 涨跌幅从
+        +0.02% 错成 +4.06%，差 4 个点）。⇒ 先从 60 分钟 K 线拿「最后一根收盘」（经交叉
+        验证 = 上一交易日真实收盘）当分母，重算 pct/chg。
 
-        ⭐ 2026-10-08 老大定调「**只看盘中**」：
-          * 盘中（09:30–16:00 ET）：正常用实时价刷新，pct = 现价 vs 上一根收盘。
-          * 盘前/盘后/休市：**不使用盘前/盘后报价当现价**，价格一律钉在「最近一次
-            盘中收盘」（K 线最后一根），此时 pct 恒为 0（因为现价就是昨收）。
-            这样页面不会出现盘前跳动的数字，也不会有「盘前涨跌」这种假信号。
+        ⭐ 2026-10-08 老大定调：**自选框全天候展示**，所以价格也全天候刷新（含盘前/盘后）：
+          * 盘中 / 盘前 / 盘后：都用实时价当现价。
+          * 盘前/盘后的实时价来自新浪 `hq.sinajs.cn`（它那时段有值）；腾讯盘前给的是
+            上一交易日收盘快照，只能兜底。
+          * 休市（周末）：无实时价，价格退化为 K 线尾收盘，涨跌幅自然为 0。
         """
         if not items:
             return items
         syms = [it["symbol"] for it in items]
+        # 盘前/盘后必须走新浪（腾讯那时段给的是上一交易日收盘快照，不是实时价）
+        live = self.quotes_now(syms)
         snap = self.tx.quotes(syms, ttl=self.quote_ttl)
         bases = self._last_closes(syms)
-        intraday = _in_regular_session()
         for it in items:
-            q = snap.get(it["symbol"])
-            base = bases.get(it["symbol"])
-            # --- 盘前/盘后/休市：价格钉在最近一次盘中收盘 ---
-            if not intraday:
+            sym = it["symbol"]
+            q = live.get(sym) or snap.get(sym)
+            base = bases.get(sym)
+            if not q:
+                # 一个源都没拿到：价格退回 K 线尾收盘，并如实标注
                 if base:
                     it["price"] = base["c"]
                     it["prev_close"] = base["c"]
                     it["prev_close_t"] = base["t"]
                     it["chg"] = 0.0
                     it["pct"] = 0.0
-                    it["pct_src"] = "last_intraday_close"
-                    it["rt"] = {"source": "最近盘中收盘", "ts": base.get("t")}
-                continue
-            if not q:
+                    it["pct_src"] = "last_close"
+                    it["rt"] = {"source": "最近收盘", "ts": base.get("t")}
                 continue
             for k in ("price", "volume", "amount", "high", "low", "open"):
                 if q.get(k) is not None:
                     it[k] = q[k]
-            it["rt"] = {"source": q["source"], "ts": q.get("ts_text")}
+            it["rt"] = {"source": q.get("source"), "ts": q.get("ts_text")}
             if base and q.get("price") is not None:
                 it["prev_close"] = base["c"]
                 it["prev_close_t"] = base["t"]
@@ -919,7 +919,7 @@ class MarketData:
                 for k in ("pct", "chg", "prev_close"):
                     if q.get(k) is not None:
                         it[k] = q[k]
-                it["pct_src"] = "tx_raw"
+                it["pct_src"] = "raw"
         return items
 
     def _last_closes(self, symbols: list[str]) -> dict[str, dict]:

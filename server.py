@@ -191,14 +191,12 @@ class Monitor:
                                "thr": float(boxes[k].get("thr", 0.5)),
                                "items": []}
 
-        # ⭐ 2026-10-08 老大定调：**只展示盘中数据**。盘前/盘后/休市一律不加载、不刷新、
-        # 不展示 —— 哪怕是收盘时段，页面也停留在「最近一个盘中时段」的口径上。
-        # （盘中时段：09:30–16:00 ET，工作日）
-        if sess != "regular":
-            out["note"] = ("现为%s（%s ET）：本栏只统计**盘中**（09:30–16:00 ET）数据，"
-                           "盘前/盘后行情不加载。开盘后自动出现。"
-                           % (out["session_name"], out["et"]))
-            return out
+        # ⭐ 2026-10-08 老大定调：**自选框全天候展示**（盘前/盘后/休市都要看得见）。
+        # 各时段的涨跌幅口径不同，靠 `session` 字段区分，前端在框上加时段角标：
+        #   regular ⇒ 当前 60 分钟 K 线（未走完按实时价算）涨跌幅，基准 = 上一根 60 分钟收盘；
+        #   pre/after ⇒ 「距昨收」口径：实时价 vs 上一交易日收盘（= K 线最后一根收盘）；
+        #   closed  ⇒ 无实时价，价格即昨收，涨跌幅恒 0（周末/节假日）。
+        # 无论哪个时段，**昨收一律以 K 线尾部收盘为准**（报价源自带的基准滞后一天，不可用）。
         if not items:
             out["note"] = "榜单尚未就绪，自选框暂时无数据"
             return out
@@ -274,9 +272,17 @@ class Monitor:
             _m = max(stock.values(), key=lambda r: abs(r.get("pct") or 0))
             out["max_abs_pct"] = {"symbol": _m.get("symbol"), "name": _m.get("name"),
                                   "pct": _m.get("pct")}
-        # 走到这里必然是 regular（非盘中上面已 return）
-        out["note"] = ("盘中 %s ET ｜ 成交额前 %d 内，当前 60 分钟 K 线（未走完按实时价算）涨跌幅达标"
-                       % (out["et"], self.top_n))
+        # 各时段口径不同，note 如实写明（前端框上也有时段角标）。
+        if sess == "regular":
+            out["note"] = ("盘中 %s ET ｜ 成交额前 %d 内，当前 60 分钟 K 线（未走完按实时价算）"
+                           "涨跌幅达标" % (out["et"], self.top_n))
+        elif sess == "closed":
+            out["note"] = ("休市 %s ET ｜ 无实时价，现价即上一交易日收盘，涨跌幅为 0。"
+                           "开盘后自动更新。" % out["et"])
+        else:
+            out["note"] = ("%s %s ET ｜ 成交额前 %d 内，**距昨收**涨跌幅（实时价 vs 上一交易日收盘）"
+                           "—— 此时没有正在走的 60 分钟 K 线，与盘中口径的含义不同"
+                           % (out["session_name"], out["et"], self.top_n))
         return out
 
     # ---------------- 单只详情 ---------------- #
@@ -292,12 +298,14 @@ class Monitor:
         summ = summarize((bars or {}).get("bars") or [],
                          self.cfg.get("indicators", {}).get("boll", {}))
         rt = self.md.realtime(symbol, (item or {}).get("name", ""))
-        # ⭐ 只认盘中：非盘中不给「当前 bar」，图表就画到最近一根盘中 K 线为止
-        # （盘前/盘后的跳动价不进图、不进报价面板）。
+        # ⭐ 全天候：各时段都给「当前 bar」，但含义不同（cur.session 区分）——
+        #   regular ⇒ 未走完的 60 分钟 bar（实线图上的虚线幽灵蜡烛）；
+        #   pre/after ⇒ 「距昨收」：现价 vs 上一交易日收盘（不是 K 线口径）；
+        #   closed ⇒ 无实时价，等同上一收盘。
         _bars = (bars or {}).get("bars") or []
         sess = session_of()
-        live = self.md.quotes_now([symbol]).get(symbol) or {} if sess == "regular" else {}
-        cur = resolve_current_bar(_bars, live.get("price"), et_now()) if sess == "regular" else None
+        live = self.md.quotes_now([symbol]).get(symbol) or {}
+        cur = resolve_current_bar(_bars, live.get("price"), et_now())
         if cur:
             cur["source"] = live.get("source")
             cur["live_ts"] = live.get("ts_text")
@@ -305,17 +313,6 @@ class Monitor:
         # prev_close/pct** —— 2026-10-08 实测：新浪与腾讯在盘前都会把「昨收」错给成
         # 前前一日（MU 报 prev_close=1045.56/pct=+4.06%，真实昨收 1087.835/仅 +0.015%）。
         rt = self._fix_rt_baseline(rt, _bars)
-        if sess != "regular":
-            # 非盘中：报价面板的「现价」也钉在最近一次盘中收盘，避免出现盘前跳动数字。
-            last = _bars[-1] if _bars else None
-            if last and rt:
-                rt["price"] = last.get("c")
-                rt["pct"] = 0.0
-                rt["chg"] = 0.0
-                rt["prev_close"] = last.get("c")
-                rt["prev_close_src"] = "kline"
-                rt["pct_src"] = "last_intraday_close"
-                rt["extended"] = None
         return {"ok": bool(bars), "symbol": symbol, "item": item,
                 "bars": (bars or {}).get("bars") or [], "summary": summ,
                 "cur_bar": cur,

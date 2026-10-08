@@ -47,14 +47,15 @@
     "boll_break": { "enabled": false, "side": "mid" }
   },
 
-  "_comment_watchlists": "自选框。每个框一条，判据 = 『在成交额前 top_n 内』且『当前 60 分钟 K 线（未走完也算）涨跌幅』超过阈值。加新框 = 在这里加一行，server / 前端都不用改。side: up=涨幅≥thr，down=跌幅≤-thr。⚠️ 只在**盘中**（09:30–16:00 ET）生效并展示；盘前/盘后/休市一律不加载、不显示。",
+  "_comment_watchlists": "自选框。每个框一条，判据 = 『在成交额前 top_n 内』且『当前 60 分钟 K 线（未走完也算）涨跌幅』超过阈值。加新框 = 在这里加一行，server / 前端都不用改。side: up=涨幅≥thr，down=跌幅≤-thr。⚠️ **全天候展示**：盘中按 60 分钟 K 线口径；盘前/盘后按『距昨收』口径（实时价 vs 上一交易日收盘，框上会标时段）；休市无实时价、涨跌幅为 0。",
   "watchlists": {
     "up60":   { "name": "60上涨", "enabled": true, "side": "up",   "thr": 0.5 },
     "down60": { "name": "60下跌", "enabled": true, "side": "down", "thr": 0.5 }
   },
 
-  "_comment_session": "时段策略。only_regular=true ⇒ 全工具只认盘中数据：盘前/盘后/休市时价格钉在最近一次盘中收盘、涨跌幅为 0、不给「当前未走完的 bar」、自选框整块隐藏。",
+  "_comment_refresh": "刷新节奏：榜单 60s（东财风控）、价格 18s、K 线 120s。**全天候**都在刷（含盘前/盘后），休市时拿到的是上一次收盘。",
+  "_comment_session": "时段策略。自选框全天候展示；涨跌幅口径随时段变化（盘中=60分钟K线；盘前/盘后=距昨收；休市=0）。昨收一律以 60 分钟 K 线尾部收盘为准 —— 报价源自带的 prev_close 在盘前会滞后一天，不可用。",
   "session": {
-    "only_regular": true
+    "watchlists_all_day": true
   }
 }

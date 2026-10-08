@@ -103,7 +103,7 @@
   .foot{color:var(--dim2);font-size:11px;padding:0 14px 16px;line-height:1.7}
 
   /* ---- 自选框 ---- */
-  .wlsec{margin:0 12px 12px;display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .wlsec{margin:12px 12px 0;display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
   .wl .phead .cnt{font-weight:400;color:var(--dim);font-size:11.5px;margin-left:2px}
   .wl .phead .thr{font-size:11px;color:var(--dim2);margin-left:auto;font-weight:400}
   .wlbody{max-height:260px;overflow:auto}
@@ -146,6 +146,8 @@
 </header>
 
 <div class="banner" id="banner"></div>
+
+<section id="wlsec" class="wlsec"></section>
 
 <main>
   <section class="panel">
@@ -197,8 +199,6 @@
     </div>
   </section>
 </main>
-
-<section id="wlsec" class="wlsec"></section>
 
 <section class="panel" style="margin:0 12px 12px">
   <div class="phead">进出榜流水
@@ -322,14 +322,13 @@ function renderFeed(){
    前端只负责展示 —— 阈值、框数都在 config.json 的 watchlists 里改。
    盘前/盘后照常显示（框上标时段），只有周末休市才隐藏。 */
 async function loadWatchlist(){
-  // ⭐ 只认盘中：非盘中**根本不请求**，避免盘前/盘后数据进入前端状态。
-  if(S.session && S.session !== 'regular'){ S.wl = null; renderWatchlists(); return; }
+  // ⭐ 2026-10-08 老大定调：自选框**全天候展示**，各时段都请求。
+  // 盘前/盘后是「距昨收」口径，盘中是 60 分钟 K 线口径 —— 服务端用 session 字段区分。
   try{
     const r = await fetch('/api/watchlist', {cache:'no-store'});
     const d = await r.json();
     S.session = d.session;                       // 服务端时段以服务器为准
     S.wl = d;
-    if(d.session !== 'regular'){ S.wl = null; }
     renderWatchlists();
   }catch(e){ /* 静默：不影响主表 */ }
 }
@@ -338,16 +337,19 @@ function renderWatchlists(){
   const box = $('wlsec');
   if(!box) return;
   const wl = S.wl || {};
-  // ⭐ 2026-10-08 老大定调：只展示盘中数据。盘前/盘后/休市整块隐藏。
-  if(wl.session !== 'regular'){ box.innerHTML = ''; box.style.display = 'none'; return; }
+  // 全天候展示 —— 拿不到数据时才隐藏。
+  if(!wl.boxes || !Object.keys(wl.boxes).length){ box.innerHTML = ''; box.style.display = 'none'; return; }
   box.style.display = '';
   const ids = Object.keys(wl.boxes || {});
   if(!ids.length){ box.innerHTML = ''; return; }
-  const sessTxt = {pre:'盘前', after:'盘后', regular:'盘中'}[wl.session] || wl.session || '';
+  const sessTxt = {pre:'盘前', after:'盘后', regular:'盘中', closed:'休市'}[wl.session] || wl.session || '';
   const isRegular = wl.session === 'regular';
   box.innerHTML = ids.map(id => {
     const b = wl.boxes[id];
     const n = (b.items||[]).length;
+    // 非盘中时阈值那行补一句口径提示（此时不是 60 分钟 K 线口径）。
+    const thrTxt = (b.side==='up'?'≥ +':'≤ ') + b.thr + '% · 成交额前 ' + (wl.top_n||30)
+                 + (isRegular ? '' : (wl.session==='closed' ? ' · 休市无实时价' : ' · 距昨收'));
     const rowsHtml = n ? b.items.map(it => {
       const pctCls = it.pct > 0 ? 'u' : (it.pct < 0 ? 'd' : 'f');
       // 幅度条：以 0 为中心，最长按 2% 满格
@@ -370,7 +372,7 @@ function renderWatchlists(){
       <div class="phead">${esc(b.name)}
         <span class="cnt">（${n} 只）</span>
         <span class="sess ${isRegular?'live':'ext'}">${esc(sessTxt)}</span>
-        <span class="thr">${b.side==='up'?'≥ +':'≤ '}${b.thr}% · 成交额前 ${wl.top_n||30}</span>
+        <span class="thr">${thrTxt}</span>
       </div>
       <div class="wlbody">${rowsHtml}</div>
       ${wl.note?`<div class="wlnote show">ⓘ ${esc(wl.note)}</div>`:''}
